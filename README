@@ -1,37 +1,504 @@
+<div align="center">
 
-This directory is intended for project header files.
+#  AI-Based Smart Navigation System for the Visually Impaired
 
-A header file is a file containing C declarations and macro definitions
-to be shared between several project source files. You request the use of a
-header file in your project source file (C, C++, etc) located in `src` folder
-by including it, with the C preprocessing directive `#include'.
+### Edge AI Obstacle Detection & Voice Guidance using ESP32-S3-CAM, HC-SR04P & YOLOv8
 
-```src/main.c
+[![Platform](https://img.shields.io/badge/Platform-ESP32--S3-blue?logo=espressif)](https://www.espressif.com/)
+[![Language](https://img.shields.io/badge/Firmware-C%2B%2B-00599C?logo=c%2B%2B)](https://en.cppreference.com/)
+[![Python](https://img.shields.io/badge/AI%20Server-Python%203-3776AB?logo=python&logoColor=white)](https://www.python.org/)
+[![YOLO](https://img.shields.io/badge/Detection-YOLOv8n-purple)](https://github.com/ultralytics/ultralytics)
+[![Termux](https://img.shields.io/badge/Runtime-Termux%20(Android)-black?logo=android)](https://termux.dev/)
+[![Flask](https://img.shields.io/badge/Dashboard-Flask-lightgrey?logo=flask)](https://flask.palletsprojects.com/)
+[![License](https://img.shields.io/badge/License-MIT-green.svg)](#-license)
 
-#include "header.h"
+</div>
 
-int main (void)
-{
- ...
-}
+---
+
+## 📖 Overview
+
+This project is a **graduation thesis (capstone) embedded systems project** implementing a low-cost, edge‑AI assistive navigation device for visually impaired users. An **ESP32‑S3‑CAM** module continuously scans the environment with an ultrasonic sensor mounted on a sweeping servo, streams live video over Wi‑Fi, and reports obstacle data over a lightweight HTTP API. An **Android phone running Termux** receives the video stream, runs **YOLOv8n** object detection on-device, fuses the result with the ultrasonic distance reading, and speaks Vietnamese voice alerts (e.g. *"Có người phía trước, cách khoảng một mét"*) through Android TTS — with a live **Flask web dashboard** for monitoring.
+
+The system is designed with **graceful degradation**: if the phone/YOLO pipeline goes offline, the ESP32 automatically falls back to a standalone ultrasonic-only buzzer warning mode, so the user is never left without obstacle feedback.
+
+> **Note on source scope:** This README is generated strictly from `main.cpp` (ESP32 firmware) and `main_fixed_termux_yolo.py` (Termux AI server) — the two files actually provided. `app_httpd.cpp`, `camera_index.h`, `camera_pins.h`, and `platformio.ini` were referenced in the request but not included in this analysis pass. Where behavior depends on them (e.g. the camera web server, exact GPIO pin mapping for the OV2640), this is explicitly marked as **inferred** rather than confirmed from source.
+
+---
+
+##  Features
+
+-  **Live MJPEG video streaming** from the ESP32-S3-CAM (`:81/stream`), consumed by the AI server with manual byte-level MJPEG parsing (no `cv2.VideoCapture`, which is unstable on Termux/Android).
+-  **Ultrasonic distance sensing (HC‑SR04P)** with interrupt-friendly polling, a **median-of-5 filter** to reject spike noise (especially from servo-induced vibration), and a `SONAR_TIMEOUT_US` guard to avoid blocking the main loop.
+-  **Continuous servo sweep (30°–150°, center 90°)** for wide-angle obstacle scanning, running on a dedicated LEDC timer to avoid conflicting with the camera's XCLK timer.
+-  **Four-level danger classification** (`SAFE` / `OBSTACLE` / `DANGEROUS` / `EXTREME_DANGER`) computed purely from absolute distance, independent of the current servo sweep angle.
+-  **Dual-mode active buzzer logic**:
+  - *Normal mode* (Wi‑Fi + YOLO both healthy): only beeps for close obstacles (< 1.5 m), since the phone/voice system handles further-range alerts.
+  - *Fallback mode* (Wi‑Fi or YOLO lost): ESP32 independently beeps at three speed tiers up to 2.5 m, acting as a safety net.
+-  **On-board HTTP Data API (port 8080)**: `/data` (JSON telemetry) and `/yolo?ok=1` (heartbeat endpoint for the phone to report liveness).
+-  **Automatic Wi‑Fi reconnection** with attempt counting and backoff, plus periodic **free heap / PSRAM monitoring** with low-memory warnings.
+-  **YOLOv8n on-device object detection** (via Ultralytics) running in a dedicated thread, decoupled from camera capture via a "latest-frame" hand-off (no unbounded queues → no memory growth).
+-  **13-class navigation-relevant whitelist** (person, vehicles, furniture, animals, bags, etc.) with English→Vietnamese name mapping for natural alerts.
+-  **Vietnamese text-to-speech voice alerts** via `termux-tts-speak`, with natural number-reading (*"một phẩy hai mét"*), directional phrasing (trái / phía trước / phải), debounce timing, and a size-1 queue so only the most recent (freshest) alert is ever spoken.
+-  **Live Flask monitoring dashboard** (port 5000): annotated video feed, distance/angle/warning readout, FPS counters, and per-subsystem health badges (ESP32 / Camera / YOLO / Heartbeat), auto-refreshing every 500 ms.
+-  **Multi-threaded Python architecture**: 6 independent daemon threads (Camera, YOLO, Data poll, Heartbeat, Voice alert + TTS worker, Flask) coordinated through a single thread-safe `SystemState` object.
+-  **Resilient networking**: every network-facing thread (camera stream, data poll, heartbeat) automatically retries on failure without ever crashing the main process.
+-  **Fully centralized configuration** — all thresholds, intervals, URLs, and model parameters are top-of-file constants in both the firmware and the Python server.
+
+---
+
+##  Hardware
+
+| Component | Role in System | Notes (from code) |
+|---|---|---|
+| **ESP32-S3-CAM** | Main microcontroller + camera host | Uses PSRAM when available (`FRAMESIZE_VGA`, fb in PSRAM); falls back to `FRAMESIZE_QVGA` / DRAM otherwise |
+| **OV2640 Camera Module** | Onboard image sensor | Configured via `esp_camera_init()`; vflip + hmirror applied to correct mounting orientation |
+| **HC-SR04P Ultrasonic Sensor** | Obstacle distance ranging | `TRIG_PIN = GPIO41`, `ECHO_PIN = GPIO42`; sampled every 100 ms, 30 ms timeout |
+| **SG90 Servo Motor** | Sweeps the ultrasonic sensor | `SERVO_PIN = GPIO14`; sweeps continuously 30°–150°, ~66°/s |
+| **Active Buzzer** | Local audible obstacle alert | `BUZZER_PIN = GPIO45` ⚠️ *(strapping pin — see [Notes](#️-important-notes--warnings))* |
+| **Android Smartphone (Termux)** | Edge AI inference host | Runs YOLOv8n, TTS, and the Flask dashboard — no cloud dependency |
+| **Li-ion Battery + TP4056 Module** | Portable power supply | Physical power components for the wearable build; not software-controlled in the provided firmware |
+
+>  The Li‑ion/TP4056 power stage is part of the physical hardware build described for this project but does not appear as a controllable subsystem in `main.cpp` (no charge-monitoring code present).
+
+---
+
+##  Software Architecture
+
+<details>
+<summary><strong> ESP32 Firmware (main.cpp) — click to expand</strong></summary>
+
+A single-loop, non-blocking Arduino-style architecture (no RTOS tasks beyond what `WebServer`/Wi‑Fi use internally):
+
+- **Setup phase**: initializes buzzer → servo → Wi‑Fi → camera → camera web server (`startCameraServer()`, defined externally in `app_httpd.cpp`) → data API server.
+- **Main loop** (`loop()`) runs a fixed sequence of non-blocking "update" functions every iteration, each internally rate-limited by its own `millis()` timestamp:
+  1. `updateWiFi()` — reconnect watchdog
+  2. `updateSonar()` — ranges every `SONAR_INTERVAL_MS` (100 ms), applies median filter
+  3. `updateWarning()` — maps distance → 4-level `WarningLevel`
+  4. `updateServo()` — advances sweep angle every `SERVO_DELAY_MS` (15 ms)
+  5. `updateYolo()` — expires the YOLO heartbeat after `YOLO_TIMEOUT_MS` (5 s)
+  6. `updateBuzzer()` — dual-mode beep logic described above
+  7. `dataServer.handleClient()` — serves `/data` and `/yolo`
+  8. `updateLog()` / `updateMemoryMonitor()` — periodic diagnostics over Serial
+  9. `yield()` — releases CPU to Wi‑Fi/watchdog tasks
+
+</details>
+
+<details>
+<summary><strong> Python AI Server (main_fixed_termux_yolo.py) — click to expand</strong></summary>
+
+A single-file, multi-threaded Python application (`SystemState` pattern), where every thread reads/writes shared state only through lock-protected methods:
+
+| Thread | Responsibility |
+|---|---|
+| `CameraThread` | Connects to the ESP32 MJPEG stream, manually parses JPEG SOI/EOI byte markers, decodes frames, tracks capture FPS, auto-reconnects on failure |
+| `YoloThread` | Pulls the latest available frame (never a queue), runs YOLOv8n inference at a capped rate, filters by confidence + class whitelist, draws bounding boxes, publishes annotated JPEG + detections |
+| `DataThread` | Polls the ESP32's `/data` endpoint for distance/angle/warning, detects ESP32 timeout |
+| `HeartbeatThread` | Periodically calls `/yolo?ok=1` so the ESP32 knows the AI pipeline is alive (drives its fallback-mode buzzer logic) |
+| `VoiceAlertThread` + `TTSWorker` | Builds Vietnamese alert sentences from fused distance + detection data, debounces repeats, speaks via `termux-tts-speak` in a separate worker so TTS never blocks alert generation |
+| `FlaskThread` | Serves the dashboard (`/`), live annotated MJPEG feed (`/video_feed`), and JSON status (`/api/status`) |
+
+</details>
+
+###  Communication Flow
+
+The ESP32 and the phone communicate purely over local Wi‑Fi HTTP — there is no cloud or message broker.
+
+```mermaid
+sequenceDiagram
+    participant ESP32 as ESP32-S3-CAM
+    participant Phone as Android (Termux AI Server)
+    participant User as User (Earphone/Speaker)
+
+    ESP32->>ESP32: Sweep servo + read HC-SR04P
+    ESP32->>Phone: MJPEG video stream (:81/stream)
+    Phone->>Phone: Decode frame, run YOLOv8n
+    Phone->>ESP32: GET /data (poll distance/angle/warning)
+    Phone->>ESP32: GET /yolo?ok=1 (heartbeat)
+    ESP32-->>Phone: JSON telemetry / heartbeat ACK
+    Phone->>Phone: Fuse distance + detections
+    Phone->>User: Vietnamese TTS voice alert
+    Phone->>Phone: Serve Flask dashboard (:5000)
 ```
 
-Including a header file produces the same results as copying the header file
-into each source file that needs it. Such copying would be time-consuming
-and error-prone. With a header file, the related declarations appear
-in only one place. If they need to be changed, they can be changed in one
-place, and programs that include the header file will automatically use the
-new version when next recompiled. The header file eliminates the labor of
-finding and changing all the copies as well as the risk that a failure to
-find one copy will result in inconsistencies within a program.
+---
 
-In C, the convention is to give header files names that end with `.h'.
+##  System Workflow
 
-Read more about using header files in official GCC documentation:
+```mermaid
+flowchart TD
+    A[ESP32-S3-CAM] --> B[Capture Image / OV2640]
+    A --> C[Measure Distance / HC-SR04P]
+    C --> D[Median Filter x5]
+    D --> E[Compute Warning Level]
+    B --> F[MJPEG Stream :81]
+    E --> G[Data API :8080/data]
+    A --> H[Buzzer Local Alert]
 
-* Include Syntax
-* Include Operation
-* Once-Only Headers
-* Computed Includes
+    F --> I[Python Server: Camera Thread]
+    G --> J[Python Server: Data Thread]
+    I --> K[YOLOv8n Detection Thread]
+    K --> L{Confidence ≥ Threshold<br/>AND class in whitelist?}
+    L -- No --> M[Discard detection]
+    L -- Yes --> N[Annotate frame + collect detection]
+    N --> O[Flask Video Feed /video_feed]
 
-https://gcc.gnu.org/onlinedocs/cpp/Header-Files.html
+    J --> P[Voice Alert Thread]
+    N --> P
+    P --> Q{distance ≤ 0 or > 1.5m?}
+    Q -- Yes --> R[No voice alert]
+    Q -- No --> S{Detection available?}
+    S -- Yes --> T[Speak object name + direction + distance]
+    S -- No --> U[Speak generic obstacle warning]
+    T --> V[TTS Queue maxsize=1]
+    U --> V
+    V --> W[TTSWorker: termux-tts-speak]
+
+    P --> X[Heartbeat Thread: GET /yolo?ok=1]
+    X --> A
+```
+
+---
+
+## 📁 Folder Structure
+
+> Generated from the files provided for this analysis. Paths referenced by the code but not included in the upload are marked `(referenced, not provided)`.
+
+```
+project-root/
+├── firmware/
+│   ├── main.cpp                      # ESP32-S3 main firmware (this repo's core logic)
+│   ├── app_httpd.cpp                 # (referenced, not provided) camera web server handlers
+│   ├── camera_index.h                # (referenced, not provided) embedded web UI for camera server
+│   ├── camera_pins.h                 # (referenced, not provided) board-specific camera GPIO mapping
+│   └── platformio.ini                # (referenced, not provided) PlatformIO build configuration
+│
+├── ai-server/
+│   └── main_fixed_termux_yolo.py     # Termux AI server: camera client, YOLO, voice, dashboard
+│
+├── models/
+│   └── yolov8n.pt                    # YOLOv8n weights (downloaded by Ultralytics on first run)
+│
+└── README.md
+```
+
+---
+
+##  Hardware Connections
+
+| ESP32-S3 Pin | Connected To | Function |
+|---|---|---|
+| `GPIO41` | HC-SR04P `TRIG` | Ultrasonic trigger pulse output |
+| `GPIO42` | HC-SR04P `ECHO` | Ultrasonic echo pulse input |
+| `GPIO14` | SG90 Servo signal | PWM servo control (50 Hz, 500–2400 µs pulse range) |
+| `GPIO45` | Active Buzzer `+` | Digital obstacle alert output  *strapping pin, see warning below* |
+| Camera data/clock/SCCB pins | OV2640 module | Defined in `camera_pins.h` *(not provided — board-specific)* |
+| 5V / 3.3V + GND | All peripherals | Shared ground required for stable HC‑SR04P + servo + buzzer operation |
+
+>  **Important Notes & Warnings**
+> - `GPIO45` is an ESP32-S3 **strapping pin** used during boot to select VDD_SPI voltage. Pulling it high/low externally at boot (e.g. via the buzzer wiring) can affect boot behavior — this is flagged directly in the firmware's pin definitions and should be tested carefully on real hardware.
+> - `pulseIn()` on the `ECHO` pin can block the CPU for up to `SONAR_TIMEOUT_US` (30 ms). The firmware mitigates this by limiting ultrasonic reads to once per `SONAR_INTERVAL_MS` (100 ms) rather than making it fully non-blocking.
+> - The servo is allocated to **LEDC timer 1** specifically to avoid clashing with **LEDC timer 0**, which the camera driver uses for the XCLK signal — do not change this without checking for timer conflicts.
+
+---
+
+## ⚙️ Installation
+
+###  ESP32 Firmware (PlatformIO)
+
+```bash
+# Clone the repository
+git clone <your-repo-url>
+cd project-root/firmware
+
+# Build and upload via PlatformIO CLI
+pio run --target upload
+
+# Monitor serial output
+pio device monitor -b 115200
+```
+
+> `platformio.ini` was not included in this analysis. You will need a configuration targeting an ESP32-S3 board with PSRAM enabled, plus the `ESP32Servo` and `ArduinoJson` libraries declared as dependencies (both are `#include`d in `main.cpp`).
+
+**Required Arduino/PlatformIO libraries** (from `main.cpp` includes):
+- `WiFi.h` / `WebServer.h` (ESP32 core)
+- `esp_camera.h` (ESP32 camera driver)
+- `ESP32Servo`
+- `ArduinoJson`
+
+###  Python AI Server (Termux on Android)
+
+```bash
+# Install Termux + Termux:API from F-Droid (required for termux-tts-speak)
+pkg update && pkg upgrade
+pkg install python opencv termux-api
+
+# Install Python dependencies
+pip install ultralytics opencv-python numpy requests flask
+
+# Run the server
+python main_fixed_termux_yolo.py
+```
+
+| Library | Purpose |
+|---|---|
+| `ultralytics` | YOLOv8n model loading and inference |
+| `opencv-python` (`cv2`) | Frame decoding, drawing, JPEG encoding |
+| `numpy` | Frame buffer handling |
+| `requests` | HTTP client for ESP32 stream/data/heartbeat |
+| `flask` | Dashboard web server |
+
+> The YOLOv8n weights (`yolov8n.pt`) are fetched automatically by Ultralytics on first run if not already present locally.
+
+###  Environment Setup
+
+1. Flash the ESP32-S3-CAM and power it on; note the IP address printed over Serial.
+2. Update `ESP32_IP` at the top of `main_fixed_termux_yolo.py` to match.
+3. Ensure the phone and the ESP32 are on the **same 2.4 GHz Wi‑Fi network** (the firmware only attempts `WIFI_STA` on the configured SSID).
+4. Grant Termux:API and microphone/notification permissions as needed for TTS.
+5. Run the Python server; open `http://<phone-ip>:5000` for the dashboard.
+
+---
+
+##  Configuration
+
+### ESP32 Firmware (`main.cpp`)
+
+| Parameter | Default | Description |
+|---|---|---|
+| `WIFI_SSID` / `WIFI_PASSWORD` | `"Fantom"` / `"00000000"` | Wi‑Fi credentials |
+| `CENTER_ANGLE` / `MIN_ANGLE` / `MAX_ANGLE` | `90` / `30` / `150` | Servo sweep range and rest position |
+| `SERVO_STEP` / `SERVO_DELAY_MS` | `1` / `15` | Sweep speed (~66°/s) |
+| `SONAR_INTERVAL_MS` | `100` | Minimum time between ultrasonic reads |
+| `SONAR_TIMEOUT_US` | `30000` | Max wait for echo pulse (~5 m range) |
+| `SONAR_FILTER_SIZE` | `5` | Median filter window size |
+| `YOLO_TIMEOUT_MS` | `5000` | Time before YOLO heartbeat is considered stale |
+| Camera resolution | `VGA` (PSRAM) / `QVGA` (no PSRAM) | Auto-selected based on `psramFound()` |
+| JPEG quality | `12` (PSRAM) / `15` (no PSRAM) | Lower number = higher quality, larger size |
+
+### Python AI Server (`main_fixed_termux_yolo.py`)
+
+| Parameter | Default | Description |
+|---|---|---|
+| `ESP32_IP` | `10.25.87.51` | IP address of the ESP32 on the local network |
+| `MODEL_PATH` | `yolov8n.pt` | YOLO weights file |
+| `CONF_THRESHOLD` | `0.65` | Minimum detection confidence kept |
+| `IOU_THRESHOLD` | `0.45` | Non-max-suppression IoU threshold |
+| `CAMERA_TARGET_FPS` | `8.0` | Cap on frame ingestion rate |
+| `YOLO_TARGET_FPS` | `2.0` | Cap on inference rate |
+| `JPEG_QUALITY` | `80` | Output stream JPEG quality |
+| `VOICE_MIN_INTERVAL_SEC` | `3.0` | Minimum gap between spoken alerts |
+| `VOICE_MAX_DISTANCE_CM` | `150.0` | Beyond this, no voice alert is spoken |
+| `HEARTBEAT_INTERVAL_SEC` | `2.0` | How often `/yolo?ok=1` is pinged |
+| `DATA_POLL_INTERVAL_SEC` | `0.2` | How often `/data` is polled |
+| `ALLOWED_CLASSES` | 13 classes | Whitelist filtering YOLO output to navigation-relevant objects |
+| `FLASK_PORT` | `5000` | Dashboard port |
+
+---
+
+##  REST API
+
+### ESP32 Endpoints (port `8080`)
+
+<details>
+<summary><strong>GET /data</strong> — Telemetry snapshot</summary>
+
+**Request:**
+```http
+GET /data HTTP/1.1
+Host: <esp32-ip>:8080
+```
+
+**Response (200 OK):**
+```json
+{
+  "distance_cm": 87.4,
+  "distance_m": 0.874,
+  "angle": 102,
+  "warning": "OBSTACLE",
+  "wifi_ok": true,
+  "camera_ok": true,
+  "yolo_ok": true
+}
+```
+</details>
+
+<details>
+<summary><strong>GET /yolo?ok=1</strong> — YOLO heartbeat</summary>
+
+**Request:**
+```http
+GET /yolo?ok=1 HTTP/1.1
+Host: <esp32-ip>:8080
+```
+
+**Responses:**
+- `200 OK` — body `"OK"` if `ok=1` was provided
+- `400 BAD_REQUEST` — if the `ok` parameter is missing or not `1`
+</details>
+
+### ESP32 Camera Server (port `81` / `80`, *inferred*)
+
+> These are inferred from the `startCameraServer()` call in `main.cpp` — the implementation (`app_httpd.cpp`) was not included in this analysis, so exact route names are not confirmed from source.
+
+| Endpoint | Purpose |
+|---|---|
+| `GET /` (port 80) | Camera web UI (Espressif `CameraWebServer` style) |
+| `GET /stream` (port 81) | MJPEG video stream consumed by the Python `CameraThread` |
+
+### Python AI Server Endpoints (port `5000`)
+
+<details>
+<summary><strong>GET /</strong> — Dashboard HTML</summary>
+Returns the rendered monitoring dashboard (`DASHBOARD_HTML`), embedding the live video feed and status panels.
+</details>
+
+<details>
+<summary><strong>GET /video_feed</strong> — Annotated MJPEG stream</summary>
+Returns a `multipart/x-mixed-replace; boundary=frame` stream of YOLO-annotated JPEG frames, sourced from `SystemState.get_annotated_jpeg()` (falls back to a placeholder image until the first frame is processed).
+</details>
+
+<details>
+<summary><strong>GET /api/status</strong> — JSON system snapshot</summary>
+
+**Response (200 OK):**
+```json
+{
+  "distance_cm": 87.4,
+  "distance_m": 0.87,
+  "angle": 102,
+  "direction": "phía trước",
+  "warning": "OBSTACLE",
+  "camera_fps": 7.8,
+  "yolo_fps": 1.9,
+  "camera_ok": true,
+  "yolo_ok": true,
+  "esp32_ok": true,
+  "heartbeat_ok": true,
+  "detections": [
+    {
+      "name_en": "person",
+      "name_vn": "người",
+      "confidence": 0.82,
+      "box": [120, 60, 340, 420]
+    }
+  ]
+}
+```
+</details>
+
+---
+
+## 🧠 AI Detection
+
+**Pipeline:**
+1. `CameraThread` pulls the latest frame from the ESP32 MJPEG stream and decodes it with OpenCV.
+2. `YoloThread` always grabs the **most recent** available frame (timestamp-checked, never re-processes a stale or already-seen frame) — preventing both backlog and redundant inference.
+3. Frames older than `YOLO_STALE_FRAME_SEC` (1.0 s) are dropped rather than processed, to avoid acting on outdated visual data.
+4. `model.predict()` runs with `CONF_THRESHOLD=0.65` and `IOU_THRESHOLD=0.45`.
+5. **Confidence filtering**: detections below threshold are discarded (defense-in-depth check even though `predict()` already filters).
+6. **Class whitelist filtering**: only the 13 `ALLOWED_CLASSES` (person, bicycle, car, motorcycle, bus, truck, chair, bench, dog, cat, bottle, backpack, suitcase) are kept — irrelevant COCO classes are ignored.
+7. Surviving detections are drawn as bounding boxes with Vietnamese-labeled confidence text, then JPEG-encoded and published to shared state.
+8. **Priority logic**: when multiple objects are detected, `VoiceAlertThread._pick_primary_detection()` selects the one with the **largest bounding-box area** (a proxy for "closest/most prominent") to announce.
+
+---
+
+##  Voice Alert System
+
+- **Fusion logic**: a spoken alert is only generated when the HC‑SR04P distance is valid (`> 0`) **and** within `VOICE_MAX_DISTANCE_CM` (1.5 m) — YOLO detections alone never trigger speech outside that range.
+- **Message construction**: if a YOLO detection is available, the system speaks the Vietnamese object name + direction + distance (e.g. *"Có xe đạp bên trái, cách khoảng không phẩy tám mét"*); otherwise it falls back to a generic *"vật cản"* (obstacle) message using ultrasonic data alone.
+- **Queue**: a `queue.Queue(maxsize=1)` holds only the single most recent message — `_enqueue_latest()` actively drains any pending (now-stale) message before inserting the new one, so the user always hears the *current* situation, never a backlog of outdated warnings.
+- **Thread separation**: `VoiceAlertThread` decides *what and when* to say; the separate `TTSWorker` thread blocks on `termux-tts-speak` so a slow TTS call never stalls alert generation or detection processing.
+- **Repeat avoidance**: `VOICE_MIN_INTERVAL_SEC` (3.0 s) enforces a minimum gap between any two spoken alerts, regardless of how fast the underlying state changes.
+
+---
+
+## ⏱️ Real-Time Algorithm
+
+Approximate steady-state timing derived directly from the configured constants:
+
+| Stage | Rate / Interval | Source |
+|---|---|---|
+| Ultrasonic sampling | every 100 ms (`SONAR_INTERVAL_MS`) | ESP32 firmware |
+| Servo sweep step | every 15 ms (`SERVO_DELAY_MS`) | ESP32 firmware |
+| Camera frame ingestion (server) | capped at 8 FPS (`CAMERA_TARGET_FPS`) | Python server |
+| YOLO inference | capped at 2 FPS (`YOLO_TARGET_FPS`) | Python server |
+| ESP32 `/data` poll | every 200 ms (`DATA_POLL_INTERVAL_SEC`) | Python server |
+| Heartbeat to ESP32 | every 2.0 s (`HEARTBEAT_INTERVAL_SEC`) | Python server |
+| Voice alert cadence | minimum 3.0 s apart (`VOICE_MIN_INTERVAL_SEC`) | Python server |
+| ESP32 YOLO-online timeout | 5.0 s without heartbeat → fallback mode | ESP32 firmware |
+
+The pipeline is intentionally **rate-decoupled**: the camera, YOLO, data-polling, heartbeat, and voice threads each run on independent timers, so a slow stage (e.g. YOLO inference) never blocks fast stages (e.g. ultrasonic sensing or buzzer response), and the ESP32 itself never waits on the phone at all — it always has its own local fallback.
+
+---
+
+## 📈 Performance
+
+> The following reflects what the code's own configuration and FPS-tracking variables report, not independently benchmarked figures. No accuracy/mAP numbers are hardcoded or claimed anywhere in the source.
+
+- **Detection speed**: capped by configuration at `YOLO_TARGET_FPS = 2.0` inferences/second, tracked live in `_yolo_fps` and shown on the dashboard.
+- **Capture speed**: capped at `CAMERA_TARGET_FPS = 8.0` frames/second, tracked live in `_camera_fps`.
+- **Latency**: end-to-end latency is bounded by the sum of capture interval, the `YOLO_STALE_FRAME_SEC` (1.0 s) staleness cutoff, and inference time — frames older than 1 second are discarded rather than processed late.
+- **Memory usage**: the ESP32 firmware logs free heap/PSRAM every 10 seconds (`updateMemoryMonitor()`) and emits a warning below 20,000 bytes free heap; the Python side avoids unbounded growth by always reading the *latest* frame instead of queuing.
+- **Accuracy**: not measured or claimed in the provided source — `CONF_THRESHOLD = 0.65` is the only accuracy-related lever exposed.
+
+---
+
+##  Future Improvements
+
+- Replace blocking `pulseIn()` ultrasonic reads with an interrupt/RMT-based driver for truly non-blocking ranging.
+- Add a second ultrasonic sensor or a ToF sensor to remove the single-sensor servo-sweep blind spots during direction transitions.
+- Persist `ESP32_IP` and other config via a settings file or first-run setup flow instead of a hardcoded constant.
+- Add bone-conduction or earphone-only audio routing to avoid alerting bystanders.
+- Expand the YOLO class whitelist and retrain/fine-tune on a navigation-specific dataset (stairs, curbs, potholes) beyond stock COCO classes.
+- Add haptic (vibration) feedback as a redundant alert channel alongside TTS and buzzer.
+- Battery level reporting from the TP4056/Li-ion stage into the `/data` API and dashboard.
+
+---
+
+## creenshots
+
+> Reserved sections — add images here.
+
+### Hardware
+<!-- ![Hardware Setup](docs/screenshots/hardware.jpg) -->
+
+### Web Camera
+<!-- ![Web Camera UI](docs/screenshots/web_camera.jpg) -->
+
+### Detection Result
+<!-- ![YOLO Detection](docs/screenshots/detection_result.jpg) -->
+
+### Terminal
+<!-- ![Terminal Output](docs/screenshots/terminal.jpg) -->
+
+### Architecture
+<!-- ![Architecture Diagram](docs/screenshots/architecture.jpg) -->
+
+---
+
+## 📄 License
+
+
+
+##  Author
+
+<div align="center">
+
+**PHAN HOÀI ANH**
+
+ Hanoi University of Science and Technology (HUST)
+ School of Electrical and Electronics Engineering
+
+**Project:** AI-Based Smart Navigation System for the Visually Impaired
+using ESP32-S3-CAM, HC-SR04P, and YOLO
+
+</div>
+
+---
+
+<div align="center">
+
+ If this project helped you, consider starring the repository!
+
+</div>
