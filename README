@@ -18,8 +18,7 @@
 
 ## 📖 Overview
 
-This project is a **graduation thesis (capstone) embedded systems project** implementing a low-cost, edge‑AI assistive navigation device for visually impaired users. An **ESP32‑S3‑CAM** module continuously scans the environment with an ultrasonic sensor mounted on a sweeping servo, streams live video over Wi‑Fi, and reports obstacle data over a lightweight HTTP API. An **Android phone running Termux** receives the video stream, runs **YOLOv8n** object detection on-device, fuses the result with the ultrasonic distance reading, and speaks Vietnamese voice alerts (e.g. *"Có người phía trước, cách khoảng một mét"*) through Android TTS — with a live **Flask web dashboard** for monitoring.
-
+This project was developed as part of an Embedded Systems course and implements a low-cost smart navigation system for visually impaired people.
 The system is designed with **graceful degradation**: if the phone/YOLO pipeline goes offline, the ESP32 automatically falls back to a standalone ultrasonic-only buzzer warning mode, so the user is never left without obstacle feedback.
 
 > **Note on source scope:** This README is generated strictly from `main.cpp` (ESP32 firmware) and `main_fixed_termux_yolo.py` (Termux AI server) — the two files actually provided. `app_httpd.cpp`, `camera_index.h`, `camera_pins.h`, and `platformio.ini` were referenced in the request but not included in this analysis pass. Where behavior depends on them (e.g. the camera web server, exact GPIO pin mapping for the OV2640), this is explicitly marked as **inferred** rather than confirmed from source.
